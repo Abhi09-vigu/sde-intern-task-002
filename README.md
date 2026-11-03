@@ -155,3 +155,134 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+---
+
+# Implementation & Architecture Documentation
+
+## Decisions
+
+### 1. Atomic Conditional Updates with Idempotency Key Tracking for Concurrency Safety
+
+- **Decision:** Rather than relying on multi-step application-level locks or vulnerable check-then-act logic (`SELECT` then `UPDATE`), payment confirmation is executed using an atomic conditional SQL statement:
+
+  ```sql
+  UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+  ```
+
+  If `changes === 1`, the current request won the race and successfully transitioned the share from unpaid to paid. If `changes === 0`, another concurrent request or previous attempt already completed the payment. The handler then retrieves the existing record: if `existing.idempotency_key === incomingKey`, it returns HTTP 200 with identical `paidAt` timestamp (idempotent replay); if the key differs, it returns HTTP 409 Conflict.
+- **Why:** In serverless environments like Cloudflare Workers where multiple isolates run concurrently across distributed edge locations, application memory is not shared. Using database-level atomic conditional updates guarantees zero double-charge vulnerabilities, prevents race conditions, and provides safe idempotency without requiring distributed locks.
+
+### 2. Explicit Deterministic Integer Ordering (`created_order`) for Member Creation Sequence
+
+- **Decision:** Instead of relying on timestamps (which can collide when multiple members are created in the same millisecond) or implicit SQLite row IDs (which are not portable and cannot be indexed in Cloudflare D1), an explicit `created_order INTEGER NOT NULL` column is maintained per household:
+
+  ```sql
+  SELECT COALESCE(MAX(created_order), 0) + 1 AS next_order FROM members WHERE home_id = ?
+  ```
+- **Why:** The bill-splitting specification dictates that when `totalCents` does not divide evenly among $N$ members, the leftover cents ($R = \text{totalCents} \pmod N$) must be distributed to members one-by-one in the exact order of their creation. Storing and indexing `created_order` ensures 100% deterministic, immutable ordering across all bill splits, balances queries, and UI displays, even in concurrent or rapid-succession member creation scenarios.
+
+### 3. Atomic D1 Batch Operations for Bill Creation & Share Distribution
+
+- **Decision:** When creating a bill with $N$ member shares, the bill insertion statement and all $N$ share insertion statements are executed within a single Cloudflare D1 `db.batch([insertBillStmt, ...shareInserts])` atomic transaction.
+- **Why:** If any individual share insertion fails (e.g., due to a constraint violation or unexpected server disconnect), the entire transaction rolls back automatically. This stops partial bill creation and guarantees that every bill in the database always has its full complement of shares matching `totalCents` exactly.
+
+---
+
+## Database Architecture & Named Constraints
+
+The database schema is defined in `api/migrations/0001_initial_schema.sql` and deployed to Cloudflare D1 (SQLite).
+
+### Tables
+
+1. **`homes`**: Stores household entity records (`id`, `name`, `created_at`).
+2. **`members`**: Stores roommates associated with a household (`id`, `home_id`, `name`, `created_order`, `created_at`).
+3. **`bills`**: Stores household expenses in integer cents (`id`, `home_id`, `title`, `total_cents`, `created_at`).
+4. **`shares`**: Stores each member's split obligation for a bill (`id`, `bill_id`, `member_id`, `amount_cents`, `paid_at`, `idempotency_key`, `created_at`).
+
+### Explicit Named Constraints
+
+The schema defines **7 explicitly named constraints** to enforce data integrity at the database layer:
+
+1. **`CONSTRAINT fk_members_home FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE`**
+   - _Stops:_ Orphan member records referencing a non-existent or deleted household.
+2. **`CONSTRAINT fk_bills_home FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE`**
+   - _Stops:_ Bills referencing a non-existent or deleted household.
+3. **`CONSTRAINT fk_shares_bill FOREIGN KEY (bill_id) REFERENCES bills(id) ON DELETE CASCADE`**
+   - _Stops:_ Orphan shares referencing a deleted or invalid bill.
+4. **`CONSTRAINT fk_shares_member FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE`**
+   - _Stops:_ Allocating shares to a member who does not exist.
+5. **`CONSTRAINT chk_bills_positive_cents CHECK (total_cents > 0)`**
+   - _Stops:_ Invalid, negative, or zero monetary amounts for bills.
+6. **`CONSTRAINT chk_shares_positive_cents CHECK (amount_cents > 0)`**
+   - _Stops:_ Negative or zero share amounts from being created.
+7. **`CONSTRAINT uq_shares_bill_member UNIQUE (bill_id, member_id)`**
+   - _Stops:_ Duplicate share allocations for the same member on the same bill.
+
+---
+
+## API Specification
+
+All monetary values are whole **integer cents** (e.g., `1000` = $10.00). All error responses strictly conform to `{ "error": "message" }`.
+
+### Homes & Members
+
+- `POST /api/homes`: Create a household. Validates non-empty `name`. Returns `201 { id, name }`.
+- `GET /api/homes`: Retrieve all households with aggregated totals (expenses, paid, outstanding, member count). Returns `200 [...]`.
+- `GET /api/homes/:homeId`: Retrieve household details and member roster. Returns `200 { id, name, createdAt, members }`.
+- `POST /api/homes/:homeId/members`: Add a member. Returns `201 { id, homeId, name }`. Returns `404` if home does not exist; `400` on empty name.
+- `GET /api/homes/:homeId/members`: Retrieve members with individual allocated, paid, and outstanding balances. Returns `200 [...]`.
+
+### Bills & Splitting
+
+- `POST /api/homes/:homeId/bills`: Create and split a bill. Validates `title` (non-empty) and `totalCents` (positive whole integer).
+  - Distributes base share $\lfloor T / N \rfloor$ to all members, and gives extra 1 cent to the first $T \pmod N$ members in creation order.
+  - Returns `201 { id, homeId, title, totalCents, shares: [{ id, memberId, amountCents, paidAt: null }] }`.
+  - Returns `404` if home not found; `422` if amount is invalid or home has 0 members.
+- `GET /api/homes/:homeId/bills`: Retrieve all bills for a home with nested shares and member names. Returns `200 [...]`.
+
+### Payments & Concurrency
+
+- `POST /api/bills/:billId/shares/:shareId/pay`: Record payment with mandatory `Idempotency-Key` header.
+  - First request marks share paid with timestamp. Returns `200 { id, memberId, amountCents, paidAt }`.
+  - Replay with identical `Idempotency-Key` returns original `200` with same `paidAt`.
+  - Conflicting request with different key returns `409 { "error": "Share already paid" }`.
+  - Missing key returns `400 { "error": "Idempotency-Key header is required" }`.
+  - Non-existent bill or share returns `404 { "error": "..." }`.
+
+### Balances
+
+- `GET /api/homes/:homeId/balances`: Calculates net unpaid debts per member across all bills in the home, preserved in member creation order. Returns `200 { balances: [{ memberId, name, outstandingCents }] }`.
+
+---
+
+## Frontend Architecture & UI/UX
+
+Built with **React 19**, **Vite**, **TypeScript**, **TanStack Router**, and **Tailwind CSS v4** with **Lucide icons**:
+
+- **Real Data Only:** No mock data, no hardcoded states, no dummy transactions. Displays meaningful empty onboarding states when the database is empty.
+- **Color Palette & Styling:** Professional SaaS aesthetic using deep navy primary (`#0f172a`), emerald green accent (`#10b981`), subtle slate borders (`border-slate-200`), and typography with Inter font.
+- **Resilience & Error Handling:** Network failures, slow APIs, 4xx, and 5xx errors surface user-friendly notifications with explicit retry options.
+- **Interactive Calculator:** When creating a bill, a real-time preview calculates the exact cent split for every member, highlighting remainder cents.
+- **Audit-Ready Payments:** Payment confirmation dialog displays the unique UUID `Idempotency-Key`, allowing clients to verify idempotency handling.
+- **Responsive Layout:** Adaptive desktop sidebar, top header with household switcher, mobile navigation drawer, and responsive cards/tables without horizontal overflow.
+
+---
+
+## Verification & Quality Assurance
+
+All verification commands pass with zero errors:
+
+```bash
+# Run all Vitest integration tests (both original suites + edge cases)
+pnpm test
+
+# Run Biome linter and formatter check
+pnpm check
+
+# Run TypeScript compiler checks across all packages
+pnpm typecheck
+
+# Build the production web application
+pnpm build
+```
